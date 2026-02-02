@@ -69,6 +69,13 @@ func main() {
 			commandCreator,
 			configuration.SetTmpdirEnvironmentVariable)
 
+		// Wrap shell script invocations with an interpreter. This is
+		// primarily intended for Windows workers where .sh scripts
+		// cannot be executed directly.
+		if configuration.ShellScriptInterpreterPath != "" {
+			r = runner.NewShellScriptWrappingRunner(r, configuration.ShellScriptInterpreterPath)
+		}
+
 		// Let bb_runner replace temporary directories with symbolic
 		// links pointing to the temporary directory set up by
 		// bb_worker.

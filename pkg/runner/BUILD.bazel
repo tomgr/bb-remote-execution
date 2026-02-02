@@ -12,6 +12,7 @@ go_library(
         "local_runner_unix.go",
         "local_runner_windows.go",
         "path_existence_checking_runner.go",
+        "shell_script_wrapping_runner.go",
         "temporary_directory_installing_runner.go",
         "temporary_directory_symlinking_runner.go",
     ],
@@ -71,6 +72,7 @@ go_test(
         "clean_runner_test.go",
         "local_runner_test.go",
         "path_existence_checking_runner_test.go",
+        "shell_script_wrapping_runner_test.go",
         "temporary_directory_symlinking_runner_test.go",
     ],
     deps = [

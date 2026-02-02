@@ -135,4 +135,14 @@ message ApplicationConfiguration {
   // https://github.com/bazelbuild/bazel/blob/master/src/main/java/com/google/devtools/build/lib/exec/local/XcodeLocalEnvProvider.java
   // https://www.smileykeith.com/2021/03/08/locking-xcode-in-bazel/
   map<string, string> apple_xcode_developer_directories = 14;
+
+  // Path to shell interpreter for executing .sh scripts.
+  //
+  // When set, any command where argv[0] ends with ".sh" will have the
+  // interpreter path prepended to the arguments list. This is primarily
+  // intended for Windows workers where shell scripts cannot be executed
+  // directly.
+  //
+  // Example: "C:\\Program Files\\Git\\bin\\bash.exe"
+  string shell_script_interpreter_path = 15;
 }
