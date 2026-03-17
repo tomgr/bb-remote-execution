@@ -21,6 +21,7 @@ import (
 	virtual_pb "github.com/buildbarn/bb-remote-execution/pkg/proto/configuration/filesystem/virtual"
 	"github.com/buildbarn/bb-storage/pkg/blockdevice"
 	"github.com/buildbarn/bb-storage/pkg/clock"
+	bb_path "github.com/buildbarn/bb-storage/pkg/filesystem/path"
 	"github.com/buildbarn/bb-storage/pkg/program"
 	"github.com/buildbarn/bb-storage/pkg/util"
 	"github.com/stretchr/testify/require"
@@ -94,6 +95,7 @@ func createWinFSPMountForTest(t *testing.T, terminationGroup program.Group, case
 			virtual.NewHandleAllocatingSymlinkFactory(
 				virtual.BaseSymlinkFactory,
 				handleAllocator.New(),
+				bb_path.LocalFormat,
 			),
 			util.DefaultErrorLogger,
 			handleAllocator,
