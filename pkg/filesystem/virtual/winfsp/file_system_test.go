@@ -1434,7 +1434,7 @@ func TestWinFSPFileSystemGetReparsePoint(t *testing.T) {
 
 		actualTarget, flags, err := extractSymlinkReparseTarget(buffer[:bytesWritten])
 		require.NoError(t, err)
-		require.Equal(t, "C:\\absolute\\target.txt", string(actualTarget))
+		require.Equal(t, `\??\C:\absolute\target.txt`, string(actualTarget))
 		require.Equal(t, uint32(0), flags)
 	})
 

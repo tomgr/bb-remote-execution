@@ -1360,17 +1360,22 @@ func getReparsePointForLeaf(ctx context.Context, leaf virtual.Leaf, buffer []byt
 	if err := path.Resolve(target, scopeWalker); err != nil {
 		return 0, err
 	}
-	targetStr, err := path.LocalFormat.GetString(targetBuilder)
+
+	if w.isRelative {
+		targetStr, err := path.LocalFormat.GetString(targetBuilder)
+		if err != nil {
+			return 0, err
+		}
+		return FillSymlinkReparseBuffer(targetStr, uint32(windowsext.SYMLINK_FLAG_RELATIVE), buffer)
+	}
+
+	// Absolute symlinks require the NT object namespace prefix
+	// (\??\) in SubstituteName for Windows to resolve them.
+	targetStr, err := targetBuilder.GetWindowsString(path.WindowsPathFormatDevicePath)
 	if err != nil {
 		return 0, err
 	}
-
-	var flags int
-	if w.isRelative {
-		flags = windowsext.SYMLINK_FLAG_RELATIVE
-	}
-
-	return FillSymlinkReparseBuffer(targetStr, uint32(flags), buffer)
+	return FillSymlinkReparseBuffer(targetStr, 0, buffer)
 }
 
 func (fs *FileSystem) GetReparsePoint(ref *ffi.FileSystemRef, file uintptr, name string, buffer []byte) (int, error) {
