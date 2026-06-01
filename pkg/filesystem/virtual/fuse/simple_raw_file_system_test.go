@@ -329,7 +329,16 @@ func TestSimpleRawFileSystemSetAttr(t *testing.T) {
 	rfs := fuse.NewSimpleRawFileSystem(rootDirectory, removalNotifierRegistrar.Call, fuse.AllowAuthenticator)
 
 	t.Run("Chown", func(t *testing.T) {
-		// chown() operations are not supported.
+		// chown() requests are forwarded to VirtualSetAttributes;
+		// implementations that don't track ownership return
+		// StatusErrPerm.
+		rootDirectory.EXPECT().VirtualSetAttributes(
+			gomock.Any(),
+			(&virtual.Attributes{}).SetOwnerUserID(1000).SetOwnerGroupID(1000),
+			fuse.AttributesMaskForFUSEAttr,
+			gomock.Any(),
+		).Return(virtual.StatusErrPerm)
+
 		var attrOut go_fuse.AttrOut
 		require.Equal(t, go_fuse.EPERM, rfs.SetAttr(nil, &go_fuse.SetAttrIn{
 			SetAttrInCommon: go_fuse.SetAttrInCommon{
@@ -425,7 +434,10 @@ func TestSimpleRawFileSystemMknod(t *testing.T) {
 
 	t.Run("Failure", func(t *testing.T) {
 		// An mknod() call for a socket that is denied.
-		rootDirectory.EXPECT().VirtualMknod(gomock.Any(), path.MustNewComponent("hello"), filesystem.FileTypeSocket, fuse.AttributesMaskForFUSEAttr, gomock.Any()).
+		var expectedCreateAttrs virtual.Attributes
+		expectedCreateAttrs.SetFileType(filesystem.FileTypeSocket)
+		expectedCreateAttrs.SetPermissions(virtual.NewPermissionsFromMode(0o777))
+		rootDirectory.EXPECT().VirtualMknod(gomock.Any(), path.MustNewComponent("hello"), &expectedCreateAttrs, fuse.AttributesMaskForFUSEAttr, gomock.Any()).
 			Return(nil, virtual.ChangeInfo{}, virtual.StatusErrPerm)
 
 		var entryOut go_fuse.EntryOut
@@ -441,8 +453,11 @@ func TestSimpleRawFileSystemMknod(t *testing.T) {
 	t.Run("Success", func(t *testing.T) {
 		// An mknod() call for a FIFO that succeeds.
 		childLeaf := mock.NewMockVirtualLeaf(ctrl)
-		rootDirectory.EXPECT().VirtualMknod(gomock.Any(), path.MustNewComponent("hello"), filesystem.FileTypeFIFO, fuse.AttributesMaskForFUSEAttr, gomock.Any()).DoAndReturn(
-			func(ctx context.Context, name path.Component, fileType filesystem.FileType, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Leaf, virtual.ChangeInfo, virtual.Status) {
+		var expectedCreateAttrs virtual.Attributes
+		expectedCreateAttrs.SetFileType(filesystem.FileTypeFIFO)
+		expectedCreateAttrs.SetPermissions(virtual.NewPermissionsFromMode(0o700))
+		rootDirectory.EXPECT().VirtualMknod(gomock.Any(), path.MustNewComponent("hello"), &expectedCreateAttrs, fuse.AttributesMaskForFUSEAttr, gomock.Any()).DoAndReturn(
+			func(ctx context.Context, name path.Component, createAttributes *virtual.Attributes, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Leaf, virtual.ChangeInfo, virtual.Status) {
 				out.SetFileType(filesystem.FileTypeFIFO)
 				out.SetInodeNumber(123)
 				out.SetLinkCount(1)
@@ -483,7 +498,9 @@ func TestSimpleRawFileSystemMkdir(t *testing.T) {
 
 	t.Run("Failure", func(t *testing.T) {
 		// An mkdir() call that fails due to an I/O error.
-		rootDirectory.EXPECT().VirtualMkdir(path.MustNewComponent("hello"), fuse.AttributesMaskForFUSEAttr, gomock.Any()).
+		var expectedCreateAttrs virtual.Attributes
+		expectedCreateAttrs.SetPermissions(virtual.NewPermissionsFromMode(0o777))
+		rootDirectory.EXPECT().VirtualMkdir(gomock.Any(), path.MustNewComponent("hello"), &expectedCreateAttrs, fuse.AttributesMaskForFUSEAttr, gomock.Any()).
 			Return(nil, virtual.ChangeInfo{}, virtual.StatusErrIO)
 
 		var entryOut go_fuse.EntryOut
@@ -498,8 +515,10 @@ func TestSimpleRawFileSystemMkdir(t *testing.T) {
 	t.Run("Success", func(t *testing.T) {
 		// An mkdir() call that succeeds.
 		childDirectory := mock.NewMockVirtualDirectory(ctrl)
-		rootDirectory.EXPECT().VirtualMkdir(path.MustNewComponent("hello"), fuse.AttributesMaskForFUSEAttr, gomock.Any()).DoAndReturn(
-			func(name path.Component, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Directory, virtual.ChangeInfo, virtual.Status) {
+		var expectedCreateAttrs virtual.Attributes
+		expectedCreateAttrs.SetPermissions(virtual.NewPermissionsFromMode(0o777))
+		rootDirectory.EXPECT().VirtualMkdir(gomock.Any(), path.MustNewComponent("hello"), &expectedCreateAttrs, fuse.AttributesMaskForFUSEAttr, gomock.Any()).DoAndReturn(
+			func(ctx context.Context, name path.Component, createAttributes *virtual.Attributes, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Directory, virtual.ChangeInfo, virtual.Status) {
 				out.SetFileType(filesystem.FileTypeDirectory)
 				out.SetInodeNumber(123)
 				out.SetLinkCount(12)
@@ -540,7 +559,7 @@ func TestSimpleRawFileSystemUnlink(t *testing.T) {
 
 	t.Run("Failure", func(t *testing.T) {
 		// An unlink() call that fails due to an I/O error.
-		rootDirectory.EXPECT().VirtualRemove(path.MustNewComponent("hello"), false, true).
+		rootDirectory.EXPECT().VirtualRemove(gomock.Any(), path.MustNewComponent("hello"), false, true).
 			Return(virtual.ChangeInfo{}, virtual.StatusErrIO)
 
 		require.Equal(t, go_fuse.EIO, rfs.Unlink(nil, &go_fuse.InHeader{
@@ -550,7 +569,7 @@ func TestSimpleRawFileSystemUnlink(t *testing.T) {
 
 	t.Run("Success", func(t *testing.T) {
 		// An unlink() call that succeeds.
-		rootDirectory.EXPECT().VirtualRemove(path.MustNewComponent("hello"), false, true).
+		rootDirectory.EXPECT().VirtualRemove(gomock.Any(), path.MustNewComponent("hello"), false, true).
 			Return(virtual.ChangeInfo{
 				Before: 5,
 				After:  6,
@@ -571,7 +590,7 @@ func TestSimpleRawFileSystemRmdir(t *testing.T) {
 
 	t.Run("Failure", func(t *testing.T) {
 		// An rmdir() call that fails due to an I/O error.
-		rootDirectory.EXPECT().VirtualRemove(path.MustNewComponent("hello"), true, false).
+		rootDirectory.EXPECT().VirtualRemove(gomock.Any(), path.MustNewComponent("hello"), true, false).
 			Return(virtual.ChangeInfo{}, virtual.StatusErrIO)
 
 		require.Equal(t, go_fuse.EIO, rfs.Rmdir(nil, &go_fuse.InHeader{
@@ -581,7 +600,7 @@ func TestSimpleRawFileSystemRmdir(t *testing.T) {
 
 	t.Run("Success", func(t *testing.T) {
 		// An rmdir() call that succeeds.
-		rootDirectory.EXPECT().VirtualRemove(path.MustNewComponent("hello"), true, false).
+		rootDirectory.EXPECT().VirtualRemove(gomock.Any(), path.MustNewComponent("hello"), true, false).
 			Return(virtual.ChangeInfo{
 				Before: 5,
 				After:  6,

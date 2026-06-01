@@ -305,7 +305,7 @@ func (f *fileBackedFile) getBazelOutputServiceStat(digestFunction *digest.Functi
 	}, nil
 }
 
-func (f *fileBackedFile) VirtualAllocate(off, size uint64) Status {
+func (f *fileBackedFile) VirtualAllocate(ctx context.Context, off, size uint64) Status {
 	f.lockMutatingData()
 	defer f.lock.Unlock()
 
@@ -390,7 +390,7 @@ func (f *fileBackedFile) VirtualApply(data any) bool {
 	return true
 }
 
-func (f *fileBackedFile) VirtualSeek(offset uint64, regionType filesystem.RegionType) (*uint64, Status) {
+func (f *fileBackedFile) VirtualSeek(ctx context.Context, offset uint64, regionType filesystem.RegionType) (*uint64, Status) {
 	f.lock.Lock()
 	if offset >= f.size {
 		f.lock.Unlock()
@@ -437,7 +437,7 @@ func (f *fileBackedFile) VirtualOpenSelf(ctx context.Context, shareAccess ShareM
 	return StatusOK
 }
 
-func (f *fileBackedFile) VirtualRead(buf []byte, off uint64) (int, bool, Status) {
+func (f *fileBackedFile) VirtualRead(ctx context.Context, buf []byte, off uint64) (int, bool, Status) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
@@ -480,6 +480,14 @@ func (f *fileBackedFile) virtualTruncate(size uint64) Status {
 }
 
 func (f *fileBackedFile) VirtualSetAttributes(ctx context.Context, in *Attributes, requested AttributesMask, out *Attributes) Status {
+	// Pool-backed regular files don't track ownership; reject chown
+	// rather than silently accepting it.
+	if _, ok := in.GetOwnerUserID(); ok {
+		return StatusErrPerm
+	}
+	if _, ok := in.GetOwnerGroupID(); ok {
+		return StatusErrPerm
+	}
 	sizeBytes, hasSizeBytes := in.GetSizeBytes()
 	if hasSizeBytes {
 		f.lockMutatingData()
@@ -503,7 +511,7 @@ func (f *fileBackedFile) VirtualSetAttributes(ctx context.Context, in *Attribute
 	return StatusOK
 }
 
-func (f *fileBackedFile) VirtualWrite(buf []byte, offset uint64) (int, Status) {
+func (f *fileBackedFile) VirtualWrite(ctx context.Context, buf []byte, offset uint64) (int, Status) {
 	f.lockMutatingData()
 	defer f.lock.Unlock()
 

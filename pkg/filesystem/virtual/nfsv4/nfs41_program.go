@@ -16,7 +16,6 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/filesystem/path"
 	"github.com/buildbarn/bb-storage/pkg/random"
 	"github.com/buildbarn/go-xdr/pkg/protocols/nfsv4"
-	"github.com/buildbarn/go-xdr/pkg/protocols/rpcv2"
 	"github.com/buildbarn/go-xdr/pkg/runtime"
 )
 
@@ -50,6 +49,7 @@ type nfs41Program struct {
 	enforcedLeaseTime  time.Duration
 	announcedLeaseTime nfsv4.NfsLease4
 	pathFormat         path.Format
+	securityFlavors    []nfsv4.Secinfo4
 
 	clientsLock                  sync.Mutex
 	now                          time.Time
@@ -74,6 +74,7 @@ func NewNFS41Program(
 	clock clock.Clock,
 	enforcedLeaseTime, announcedLeaseTime time.Duration,
 	pathFormat path.Format,
+	securityFlavors []nfsv4.Secinfo4,
 ) nfsv4.Nfs4Program {
 	var attributes virtual.Attributes
 	rootDirectory.VirtualGetAttributes(context.Background(), virtual.AttributesMaskFileHandle, &attributes)
@@ -91,6 +92,7 @@ func NewNFS41Program(
 		enforcedLeaseTime:  enforcedLeaseTime,
 		announcedLeaseTime: nfsv4.NfsLease4(announcedLeaseTime.Seconds()),
 		pathFormat:         pathFormat,
+		securityFlavors:    securityFlavors,
 
 		randomNumberGenerator:        randomNumberGenerator,
 		clientsByOwnerID:             map[string]*nfs41ClientState{},
@@ -416,9 +418,12 @@ func (p *nfs41Program) writeAttributes(attributes *virtual.Attributes, attrReque
 					(1 << (nfsv4.FATTR4_NUMLINKS - 32)) |
 					(1 << (nfsv4.FATTR4_OWNER - 32)) |
 					(1 << (nfsv4.FATTR4_OWNER_GROUP - 32)) |
+					(1 << (nfsv4.FATTR4_RAWDEV - 32)) |
 					(1 << (nfsv4.FATTR4_TIME_ACCESS - 32)) |
+					(1 << (nfsv4.FATTR4_TIME_ACCESS_SET - 32)) |
 					(1 << (nfsv4.FATTR4_TIME_METADATA - 32)) |
-					(1 << (nfsv4.FATTR4_TIME_MODIFY - 32)),
+					(1 << (nfsv4.FATTR4_TIME_MODIFY - 32)) |
+					(1 << (nfsv4.FATTR4_TIME_MODIFY_SET - 32)),
 				1 << (nfsv4.FATTR4_SUPPATTR_EXCLCREAT - 64),
 			})
 		}
@@ -522,13 +527,30 @@ func (p *nfs41Program) writeAttributes(attributes *virtual.Attributes, attrReque
 			}
 			nfsv4.WriteUtf8strMixed(w, v)
 		}
+		if b := uint32(1 << (nfsv4.FATTR4_RAWDEV - 32)); f&b != 0 {
+			s |= b
+			var sd nfsv4.Specdata4
+			if devNum, ok := attributes.GetDeviceNumber(); ok {
+				maj, min := devNum.ToMajorMinor()
+				sd = nfsv4.Specdata4{Specdata1: maj, Specdata2: min}
+			}
+			sd.WriteTo(w)
+		}
 		if b := uint32(1 << (nfsv4.FATTR4_TIME_ACCESS - 32)); f&b != 0 {
 			s |= b
-			deterministicNfstime4.WriteTo(w)
+			t := deterministicNfstime4
+			if lastAccessTime, ok := attributes.GetLastAccessTime(); ok {
+				t = timeToNfstime4(lastAccessTime)
+			}
+			t.WriteTo(w)
 		}
 		if b := uint32(1 << (nfsv4.FATTR4_TIME_METADATA - 32)); f&b != 0 {
 			s |= b
-			deterministicNfstime4.WriteTo(w)
+			t := deterministicNfstime4
+			if lastStatusChangeTime, ok := attributes.GetLastStatusChangeTime(); ok {
+				t = timeToNfstime4(lastStatusChangeTime)
+			}
+			t.WriteTo(w)
 		}
 		if b := uint32(1 << (nfsv4.FATTR4_TIME_MODIFY - 32)); f&b != 0 {
 			s |= b
@@ -974,13 +996,13 @@ func (p *nfs41Program) opSequence(ctx context.Context, args *nfsv4.Sequence4args
 				})
 				result.status = res.RcrStatus
 			case *nfsv4.NfsArgop4_OP_REMOVE:
-				res := state.opRemove(&op.Opremove)
+				res := state.opRemove(ctx, &op.Opremove)
 				result.resArray = append(result.resArray, &nfsv4.NfsResop4_OP_REMOVE{
 					Opremove: res,
 				})
 				result.status = res.GetStatus()
 			case *nfsv4.NfsArgop4_OP_RENAME:
-				res := state.opRename(&op.Oprename)
+				res := state.opRename(ctx, &op.Oprename)
 				result.resArray = append(result.resArray, &nfsv4.NfsResop4_OP_RENAME{
 					Oprename: res,
 				})
@@ -1865,24 +1887,35 @@ func (s *sequenceState) opCreate(ctx context.Context, args *nfsv4.Create4args) n
 		return &nfsv4.Create4res_default{Status: st}
 	}
 
-	var attributes virtual.Attributes
+	var createAttributes virtual.Attributes
+	if st := fattr4ToAttributes(&args.Createattrs, &createAttributes); st != nfsv4.NFS4_OK {
+		return &nfsv4.Create4res_default{Status: st}
+	}
+	var actualAttributes virtual.Attributes
 	var changeInfo virtual.ChangeInfo
 	var fileHandle nfs41FileHandle
 	var vs virtual.Status
 	switch objectType := args.Objtype.(type) {
-	case *nfsv4.Createtype4_NF4BLK, *nfsv4.Createtype4_NF4CHR:
-		// Character and block devices can only be provided as
-		// part of input roots, if workers are set up to provide
-		// them. They can't be created through the virtual file
-		// system.
-		return &nfsv4.Create4res_default{Status: nfsv4.NFS4ERR_PERM}
+	case *nfsv4.Createtype4_NF4BLK:
+		createAttributes.SetFileType(filesystem.FileTypeBlockDevice)
+		createAttributes.SetDeviceNumber(filesystem.NewDeviceNumberFromMajorMinor(objectType.Devdata.Specdata1, objectType.Devdata.Specdata2))
+		var leaf virtual.Leaf
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
+		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
+	case *nfsv4.Createtype4_NF4CHR:
+		createAttributes.SetFileType(filesystem.FileTypeCharacterDevice)
+		createAttributes.SetDeviceNumber(filesystem.NewDeviceNumberFromMajorMinor(objectType.Devdata.Specdata1, objectType.Devdata.Specdata2))
+		var leaf virtual.Leaf
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
+		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	case *nfsv4.Createtype4_NF4DIR:
 		var directory virtual.Directory
-		directory, changeInfo, vs = currentDirectory.VirtualMkdir(name, virtual.AttributesMaskFileHandle, &attributes)
+		directory, changeInfo, vs = currentDirectory.VirtualMkdir(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
 		fileHandle.node = virtual.DirectoryChild{}.FromDirectory(directory)
 	case *nfsv4.Createtype4_NF4FIFO:
+		createAttributes.SetFileType(filesystem.FileTypeFIFO)
 		var leaf virtual.Leaf
-		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, filesystem.FileTypeFIFO, virtual.AttributesMaskFileHandle, &attributes)
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
 		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	case *nfsv4.Createtype4_NF4LNK:
 		if !utf8.Valid(objectType.Linkdata) {
@@ -1894,12 +1927,13 @@ func (s *sequenceState) opCreate(ctx context.Context, args *nfsv4.Create4args) n
 			s.program.pathFormat.NewParser(string(objectType.Linkdata)),
 			name,
 			virtual.AttributesMaskFileHandle,
-			&attributes,
+			&actualAttributes,
 		)
 		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	case *nfsv4.Createtype4_NF4SOCK:
+		createAttributes.SetFileType(filesystem.FileTypeSocket)
 		var leaf virtual.Leaf
-		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, filesystem.FileTypeSocket, virtual.AttributesMaskFileHandle, &attributes)
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
 		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	default:
 		return &nfsv4.Create4res_default{Status: nfsv4.NFS4ERR_BADTYPE}
@@ -1907,7 +1941,7 @@ func (s *sequenceState) opCreate(ctx context.Context, args *nfsv4.Create4args) n
 	if vs != virtual.StatusOK {
 		return &nfsv4.Create4res_default{Status: toNFSv4Status(vs)}
 	}
-	fileHandle.handle = attributes.GetFileHandle()
+	fileHandle.handle = actualAttributes.GetFileHandle()
 
 	s.currentFileHandle = fileHandle
 	return &nfsv4.Create4res_NFS4_OK{
@@ -2462,7 +2496,7 @@ func (s *sequenceState) opRead(ctx context.Context, args *nfsv4.Read4args) nfsv4
 	defer cleanup()
 
 	buf := make([]byte, args.Count)
-	n, eof, vs := currentLeaf.VirtualRead(buf, args.Offset)
+	n, eof, vs := currentLeaf.VirtualRead(ctx, buf, args.Offset)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Read4res_default{Status: toNFSv4Status(vs)}
 	}
@@ -2557,7 +2591,7 @@ func (sequenceState) opReclaimComplete(args *nfsv4.ReclaimComplete4args) nfsv4.R
 	return nfsv4.ReclaimComplete4res{RcrStatus: nfsv4.NFS4_OK}
 }
 
-func (s *sequenceState) opRename(args *nfsv4.Rename4args) nfsv4.Rename4res {
+func (s *sequenceState) opRename(ctx context.Context, args *nfsv4.Rename4args) nfsv4.Rename4res {
 	oldDirectory, st := s.savedFileHandle.getDirectory()
 	if st != nfsv4.NFS4_OK {
 		return &nfsv4.Rename4res_default{Status: st}
@@ -2575,7 +2609,7 @@ func (s *sequenceState) opRename(args *nfsv4.Rename4args) nfsv4.Rename4res {
 		return &nfsv4.Rename4res_default{Status: nfsv4.NFS4ERR_BADNAME}
 	}
 
-	oldChangeInfo, newChangeInfo, vs := oldDirectory.VirtualRename(oldName, newDirectory, newName)
+	oldChangeInfo, newChangeInfo, vs := oldDirectory.VirtualRename(ctx, oldName, newDirectory, newName)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Rename4res_default{Status: toNFSv4Status(vs)}
 	}
@@ -2587,7 +2621,7 @@ func (s *sequenceState) opRename(args *nfsv4.Rename4args) nfsv4.Rename4res {
 	}
 }
 
-func (s *sequenceState) opRemove(args *nfsv4.Remove4args) nfsv4.Remove4res {
+func (s *sequenceState) opRemove(ctx context.Context, args *nfsv4.Remove4args) nfsv4.Remove4res {
 	currentDirectory, st := s.currentFileHandle.getDirectory()
 	if st != nfsv4.NFS4_OK {
 		return &nfsv4.Remove4res_default{Status: st}
@@ -2597,7 +2631,7 @@ func (s *sequenceState) opRemove(args *nfsv4.Remove4args) nfsv4.Remove4res {
 		return &nfsv4.Remove4res_default{Status: st}
 	}
 
-	changeInfo, vs := currentDirectory.VirtualRemove(name, true, true)
+	changeInfo, vs := currentDirectory.VirtualRemove(ctx, name, true, true)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Remove4res_default{Status: toNFSv4Status(vs)}
 	}
@@ -2630,9 +2664,6 @@ func (s *sequenceState) opSecInfo(ctx context.Context, args *nfsv4.Secinfo4args)
 	// NFS4ERR_WRONGSEC is returned from another NFS operation. In
 	// practice, we even see it being called if no such error was
 	// returned.
-	//
-	// Because this NFS server is intended to be used for loopback
-	// purposes only, simply announce the use of AUTH_NONE.
 	currentDirectory, st := s.currentFileHandle.getDirectory()
 	if st != nfsv4.NFS4_OK {
 		return &nfsv4.Secinfo4res_default{Status: st}
@@ -2655,13 +2686,7 @@ func (s *sequenceState) opSecInfo(ctx context.Context, args *nfsv4.Secinfo4args)
 	//
 	// More details: RFC 8881, section 2.6.3.1.1.8.
 	s.currentFileHandle = nfs41FileHandle{}
-	return &nfsv4.Secinfo4res_NFS4_OK{
-		Resok4: []nfsv4.Secinfo4{
-			&nfsv4.Secinfo4_default{
-				Flavor: rpcv2.AUTH_NONE,
-			},
-		},
-	}
+	return &nfsv4.Secinfo4res_NFS4_OK{Resok4: s.program.securityFlavors}
 }
 
 func (s *sequenceState) opSecInfoNoName(args *nfsv4.SecinfoNoName4args) nfsv4.SecinfoNoName4res {
@@ -2670,13 +2695,7 @@ func (s *sequenceState) opSecInfoNoName(args *nfsv4.SecinfoNoName4args) nfsv4.Se
 	}
 
 	s.currentFileHandle = nfs41FileHandle{}
-	return &nfsv4.Secinfo4res_NFS4_OK{
-		Resok4: []nfsv4.Secinfo4{
-			&nfsv4.Secinfo4_default{
-				Flavor: rpcv2.AUTH_NONE,
-			},
-		},
-	}
+	return &nfsv4.Secinfo4res_NFS4_OK{Resok4: s.program.securityFlavors}
 }
 
 func (sequenceState) opSequence(args *nfsv4.Sequence4args) nfsv4.Sequence4res {
@@ -2753,7 +2772,7 @@ func (s *sequenceState) opWrite(ctx context.Context, args *nfsv4.Write4args) nfs
 	}
 	defer cleanup()
 
-	n, vs := currentLeaf.VirtualWrite(args.Data, args.Offset)
+	n, vs := currentLeaf.VirtualWrite(ctx, args.Data, args.Offset)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Write4res_default{Status: toNFSv4Status(vs)}
 	}

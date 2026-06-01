@@ -3,7 +3,6 @@ package virtual
 import (
 	"context"
 
-	"github.com/buildbarn/bb-storage/pkg/filesystem"
 	"github.com/buildbarn/bb-storage/pkg/filesystem/path"
 )
 
@@ -29,25 +28,25 @@ func (ReadOnlyDirectory) VirtualLink(ctx context.Context, name path.Component, l
 
 // VirtualMkdir is an implementation of the mkdir() system call that
 // treats the target directory as being read-only.
-func (ReadOnlyDirectory) VirtualMkdir(name path.Component, requested AttributesMask, out *Attributes) (Directory, ChangeInfo, Status) {
+func (ReadOnlyDirectory) VirtualMkdir(ctx context.Context, name path.Component, createAttributes *Attributes, requested AttributesMask, out *Attributes) (Directory, ChangeInfo, Status) {
 	return nil, ChangeInfo{}, StatusErrROFS
 }
 
 // VirtualMknod is an implementation of the mknod() system call that
 // treats the target directory as being read-only.
-func (ReadOnlyDirectory) VirtualMknod(ctx context.Context, name path.Component, fileType filesystem.FileType, requested AttributesMask, out *Attributes) (Leaf, ChangeInfo, Status) {
+func (ReadOnlyDirectory) VirtualMknod(ctx context.Context, name path.Component, createAttributes *Attributes, requested AttributesMask, createdFileAttributes *Attributes) (Leaf, ChangeInfo, Status) {
 	return nil, ChangeInfo{}, StatusErrROFS
 }
 
 // VirtualRename is an implementation of the rename() system call that
 // treats the target directory as being read-only.
-func (ReadOnlyDirectory) VirtualRename(oldName path.Component, newDirectory Directory, newName path.Component) (ChangeInfo, ChangeInfo, Status) {
+func (ReadOnlyDirectory) VirtualRename(ctx context.Context, oldName path.Component, newDirectory Directory, newName path.Component) (ChangeInfo, ChangeInfo, Status) {
 	return ChangeInfo{}, ChangeInfo{}, StatusErrROFS
 }
 
 // VirtualRemove is an implementation of the unlink() and rmdir() system
 // calls that treats the target directory as being read-only.
-func (ReadOnlyDirectory) VirtualRemove(name path.Component, removeDirectory, removeLeaf bool) (ChangeInfo, Status) {
+func (ReadOnlyDirectory) VirtualRemove(ctx context.Context, name path.Component, removeDirectory, removeLeaf bool) (ChangeInfo, Status) {
 	return ChangeInfo{}, StatusErrROFS
 }
 

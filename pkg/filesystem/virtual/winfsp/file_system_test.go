@@ -436,8 +436,9 @@ func TestWinFSPFileSystemRead(t *testing.T) {
 		// Read and validate the data
 		file.EXPECT().VirtualRead(
 			gomock.Any(),
+			gomock.Any(),
 			uint64(0),
-		).DoAndReturn(func(buffer []byte, offset uint64) (int, bool, virtual.Status) {
+		).DoAndReturn(func(ctx context.Context, buffer []byte, offset uint64) (int, bool, virtual.Status) {
 			n := copy(buffer, expectedContent)
 			return n, false, virtual.StatusOK
 		})
@@ -495,6 +496,7 @@ func TestWinFSPFileSystemWrite(t *testing.T) {
 		// Write to the file
 		fileContent := []byte("Hello, World!")
 		file.EXPECT().VirtualWrite(
+			gomock.Any(),
 			fileContent,
 			uint64(0), // offset
 		).Return(len(fileContent), virtual.StatusOK)
@@ -1088,6 +1090,7 @@ func TestWinFSPFileSystemRename(t *testing.T) {
 		).Return(virtual.DirectoryChild{}, virtual.StatusErrNoEnt)
 
 		rootDirectory.EXPECT().VirtualRename(
+			gomock.Any(),
 			path.MustNewComponent("oldname.txt"),
 			rootDirectory,
 			path.MustNewComponent("newname.txt"),
@@ -1177,6 +1180,7 @@ func TestWinFSPFileSystemRename(t *testing.T) {
 		})
 
 		rootDirectory.EXPECT().VirtualRename(
+			gomock.Any(),
 			path.MustNewComponent("source.txt"),
 			rootDirectory,
 			path.MustNewComponent("target.txt"),
@@ -1223,6 +1227,7 @@ func TestWinFSPFileSystemRename(t *testing.T) {
 		})
 
 		rootDirectory.EXPECT().VirtualRename(
+			gomock.Any(),
 			path.MustNewComponent("samefile.txt"),
 			rootDirectory,
 			path.MustNewComponent("samefile.txt"),
@@ -1483,10 +1488,12 @@ func TestWinFSPFileSystemDirectoryCreation(t *testing.T) {
 	t.Run("CreateNewDirectory", func(t *testing.T) {
 		// Simulate creating a new directory
 		rootDirectory.EXPECT().VirtualMkdir(
+			gomock.Any(),
 			path.MustNewComponent("newdir"),
+			&virtual.Attributes{},
 			winfsp.AttributesMaskForWinFSPAttr,
 			gomock.Any(),
-		).DoAndReturn(func(name path.Component, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Directory, virtual.ChangeInfo, virtual.Status) {
+		).DoAndReturn(func(ctx context.Context, name path.Component, createAttributes *virtual.Attributes, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Directory, virtual.ChangeInfo, virtual.Status) {
 			out.SetFileType(filesystem.FileTypeDirectory)
 			out.SetInodeNumber(900)
 			out.SetPermissions(virtual.PermissionsExecute | virtual.PermissionsRead | virtual.PermissionsWrite)
@@ -1516,10 +1523,12 @@ func TestWinFSPFileSystemDirectoryCreation(t *testing.T) {
 	t.Run("CreateDirectoryAlreadyExists", func(t *testing.T) {
 		// Try to create a directory that already exists
 		rootDirectory.EXPECT().VirtualMkdir(
+			gomock.Any(),
 			path.MustNewComponent("existingdir"),
+			&virtual.Attributes{},
 			winfsp.AttributesMaskForWinFSPAttr,
 			gomock.Any(),
-		).DoAndReturn(func(name path.Component, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Directory, virtual.ChangeInfo, virtual.Status) {
+		).DoAndReturn(func(ctx context.Context, name path.Component, createAttributes *virtual.Attributes, requested virtual.AttributesMask, out *virtual.Attributes) (virtual.Directory, virtual.ChangeInfo, virtual.Status) {
 			return nil, virtual.ChangeInfo{}, virtual.StatusErrExist
 		})
 
@@ -1590,6 +1599,7 @@ func TestWinFSPFileSystemDirectoryRemoval(t *testing.T) {
 		require.NoError(t, err)
 
 		rootDirectory.EXPECT().VirtualRemove(
+			gomock.Any(),
 			path.MustNewComponent("emptydir"),
 			true,
 			false,
@@ -1650,6 +1660,7 @@ func TestWinFSPFileSystemFileRemoval(t *testing.T) {
 		require.NoError(t, err)
 
 		rootDirectory.EXPECT().VirtualRemove(
+			gomock.Any(),
 			path.MustNewComponent("deleteme.txt"),
 			false,
 			true,
@@ -1968,6 +1979,7 @@ func TestWinFSPFileSystemSymlinkCreation(t *testing.T) {
 		reparseBuffer := createSymlinkReparseBuffer(targetPath, windowsext.SYMLINK_FLAG_RELATIVE)
 
 		rootDirectory.EXPECT().VirtualRemove(
+			gomock.Any(),
 			path.MustNewComponent("symlink.txt"),
 			true,
 			true,
@@ -2032,6 +2044,7 @@ func TestWinFSPFileSystemSymlinkCreation(t *testing.T) {
 		reparseBuffer := createSymlinkReparseBuffer(targetPath, 0)
 
 		rootDirectory.EXPECT().VirtualRemove(
+			gomock.Any(),
 			path.MustNewComponent("abs_symlink.txt"),
 			true,
 			true,

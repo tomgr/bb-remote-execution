@@ -853,7 +853,7 @@ func (i *inMemoryPrepopulatedDirectory) VirtualLookup(ctx context.Context, name 
 	return DirectoryChild{}, StatusErrNoEnt
 }
 
-func (i *inMemoryPrepopulatedDirectory) VirtualMkdir(name path.Component, requested AttributesMask, out *Attributes) (Directory, ChangeInfo, Status) {
+func (i *inMemoryPrepopulatedDirectory) VirtualMkdir(ctx context.Context, name path.Component, createAttributes *Attributes, requested AttributesMask, out *Attributes) (Directory, ChangeInfo, Status) {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
@@ -879,7 +879,17 @@ func (i *inMemoryPrepopulatedDirectory) VirtualMkdir(name path.Component, reques
 	}, StatusOK
 }
 
-func (i *inMemoryPrepopulatedDirectory) VirtualMknod(ctx context.Context, name path.Component, fileType filesystem.FileType, requested AttributesMask, out *Attributes) (Leaf, ChangeInfo, Status) {
+func (i *inMemoryPrepopulatedDirectory) VirtualMknod(ctx context.Context, name path.Component, createAttributes *Attributes, requested AttributesMask, out *Attributes) (Leaf, ChangeInfo, Status) {
+	// Block and character devices have no backing in an in-memory
+	// directory; reject rather than create an inert inode.
+	fileType := createAttributes.GetFileType()
+	switch fileType {
+	case filesystem.FileTypeFIFO, filesystem.FileTypeSocket:
+		// allowed
+	default:
+		return nil, ChangeInfo{}, StatusErrPerm
+	}
+
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
@@ -957,7 +967,7 @@ func (i *inMemoryPrepopulatedDirectory) VirtualReadDir(ctx context.Context, firs
 	return StatusOK
 }
 
-func (i *inMemoryPrepopulatedDirectory) VirtualRename(oldName path.Component, newDirectory Directory, newName path.Component) (ChangeInfo, ChangeInfo, Status) {
+func (i *inMemoryPrepopulatedDirectory) VirtualRename(ctx context.Context, oldName path.Component, newDirectory Directory, newName path.Component) (ChangeInfo, ChangeInfo, Status) {
 	iOld := i
 	iNew, ok := newDirectory.(*inMemoryPrepopulatedDirectory)
 	if !ok {
@@ -1060,7 +1070,7 @@ func (i *inMemoryPrepopulatedDirectory) VirtualRename(oldName path.Component, ne
 		}, StatusOK
 }
 
-func (i *inMemoryPrepopulatedDirectory) VirtualRemove(name path.Component, removeDirectory, removeLeaf bool) (ChangeInfo, Status) {
+func (i *inMemoryPrepopulatedDirectory) VirtualRemove(ctx context.Context, name path.Component, removeDirectory, removeLeaf bool) (ChangeInfo, Status) {
 	lockPile := re_sync.LockPile{}
 	defer lockPile.UnlockAll()
 	lockPile.Lock(&i.lock)
@@ -1104,6 +1114,14 @@ func (i *inMemoryPrepopulatedDirectory) VirtualRemove(name path.Component, remov
 func (i *inMemoryPrepopulatedDirectory) VirtualSetAttributes(ctx context.Context, in *Attributes, requested AttributesMask, out *Attributes) Status {
 	if _, ok := in.GetSizeBytes(); ok {
 		return StatusErrInval
+	}
+	// In-memory directories don't track ownership; reject chown
+	// rather than silently accepting it.
+	if _, ok := in.GetOwnerUserID(); ok {
+		return StatusErrPerm
+	}
+	if _, ok := in.GetOwnerGroupID(); ok {
+		return StatusErrPerm
 	}
 	i.VirtualGetAttributes(ctx, requested, out)
 	return StatusOK

@@ -54,6 +54,8 @@ func toFUSEStatus(s virtual.Status) fuse.Status {
 		return fuse.EIO
 	case virtual.StatusErrIsDir:
 		return fuse.EISDIR
+	case virtual.StatusErrNameTooLong:
+		return fuse.Status(syscall.ENAMETOOLONG)
 	case virtual.StatusErrNoEnt:
 		return fuse.ENOENT
 	case virtual.StatusErrNotDir:
@@ -388,8 +390,11 @@ func (rfs *simpleRawFileSystem) SetAttr(cancel <-chan struct{}, input *fuse.SetA
 	rfs.nodeLock.RUnlock()
 
 	var attributesIn virtual.Attributes
-	if input.Valid&(fuse.FATTR_UID|fuse.FATTR_GID) != 0 {
-		return fuse.EPERM
+	if input.Valid&fuse.FATTR_UID != 0 {
+		attributesIn.SetOwnerUserID(input.Uid)
+	}
+	if input.Valid&fuse.FATTR_GID != 0 {
+		attributesIn.SetOwnerGroupID(input.Gid)
 	}
 	if input.Valid&fuse.FATTR_MODE != 0 {
 		attributesIn.SetPermissions(virtual.NewPermissionsFromMode(input.Mode))
@@ -426,8 +431,11 @@ func (rfs *simpleRawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodI
 		return fuse.EPERM
 	}
 
+	var createAttributes virtual.Attributes
+	createAttributes.SetFileType(fileType)
+	createAttributes.SetPermissions(virtual.NewPermissionsFromMode(input.Mode & 0o7777))
 	var attributes virtual.Attributes
-	child, _, vs := i.VirtualMknod(ctx, path.MustNewComponent(name), fileType, AttributesMaskForFUSEAttr, &attributes)
+	child, _, vs := i.VirtualMknod(ctx, path.MustNewComponent(name), &createAttributes, AttributesMaskForFUSEAttr, &attributes)
 	if vs != virtual.StatusOK {
 		return toFUSEStatus(vs)
 	}
@@ -436,45 +444,63 @@ func (rfs *simpleRawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodI
 }
 
 func (rfs *simpleRawFileSystem) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
+	ctx, s := rfs.createContext(cancel, &input.Caller)
+	if s != fuse.OK {
+		return s
+	}
 	rfs.nodeLock.RLock()
 	i := rfs.getDirectoryLocked(input.NodeId)
 	rfs.nodeLock.RUnlock()
 
+	var createAttributes virtual.Attributes
+	createAttributes.SetPermissions(virtual.NewPermissionsFromMode(input.Mode & 0o7777))
 	var attributes virtual.Attributes
-	child, _, s := i.VirtualMkdir(path.MustNewComponent(name), AttributesMaskForFUSEAttr, &attributes)
-	if s != virtual.StatusOK {
-		return toFUSEStatus(s)
+	child, _, vs := i.VirtualMkdir(ctx, path.MustNewComponent(name), &createAttributes, AttributesMaskForFUSEAttr, &attributes)
+	if vs != virtual.StatusOK {
+		return toFUSEStatus(vs)
 	}
 	rfs.addDirectory(child, &attributes, out)
 	return fuse.OK
 }
 
 func (rfs *simpleRawFileSystem) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
+	ctx, s := rfs.createContext(cancel, &header.Caller)
+	if s != fuse.OK {
+		return s
+	}
 	rfs.nodeLock.RLock()
 	i := rfs.getDirectoryLocked(header.NodeId)
 	rfs.nodeLock.RUnlock()
 
-	_, s := i.VirtualRemove(path.MustNewComponent(name), false, true)
-	return toFUSEStatus(s)
+	_, vs := i.VirtualRemove(ctx, path.MustNewComponent(name), false, true)
+	return toFUSEStatus(vs)
 }
 
 func (rfs *simpleRawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
+	ctx, s := rfs.createContext(cancel, &header.Caller)
+	if s != fuse.OK {
+		return s
+	}
 	rfs.nodeLock.RLock()
 	i := rfs.getDirectoryLocked(header.NodeId)
 	rfs.nodeLock.RUnlock()
 
-	_, s := i.VirtualRemove(path.MustNewComponent(name), true, false)
-	return toFUSEStatus(s)
+	_, vs := i.VirtualRemove(ctx, path.MustNewComponent(name), true, false)
+	return toFUSEStatus(vs)
 }
 
 func (rfs *simpleRawFileSystem) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName, newName string) fuse.Status {
+	ctx, s := rfs.createContext(cancel, &input.Caller)
+	if s != fuse.OK {
+		return s
+	}
 	rfs.nodeLock.RLock()
 	iOld := rfs.getDirectoryLocked(input.NodeId)
 	iNew := rfs.getDirectoryLocked(input.Newdir)
 	rfs.nodeLock.RUnlock()
 
-	_, _, s := iOld.VirtualRename(path.MustNewComponent(oldName), iNew, path.MustNewComponent(newName))
-	return toFUSEStatus(s)
+	_, _, vs := iOld.VirtualRename(ctx, path.MustNewComponent(oldName), iNew, path.MustNewComponent(newName))
+	return toFUSEStatus(vs)
 }
 
 func (rfs *simpleRawFileSystem) Link(cancel <-chan struct{}, input *fuse.LinkIn, filename string, out *fuse.EntryOut) fuse.Status {
@@ -679,18 +705,26 @@ func (rfs *simpleRawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn,
 }
 
 func (rfs *simpleRawFileSystem) Read(cancel <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+	ctx, s := rfs.createContext(cancel, &input.Caller)
+	if s != fuse.OK {
+		return nil, s
+	}
 	rfs.nodeLock.RLock()
 	i := rfs.getLeafLocked(input.NodeId)
 	rfs.nodeLock.RUnlock()
 
-	nRead, _, s := i.VirtualRead(buf, input.Offset)
-	if s != virtual.StatusOK {
-		return nil, toFUSEStatus(s)
+	nRead, _, vs := i.VirtualRead(ctx, buf, input.Offset)
+	if vs != virtual.StatusOK {
+		return nil, toFUSEStatus(vs)
 	}
 	return fuse.ReadResultData(buf[:nRead]), fuse.OK
 }
 
 func (rfs *simpleRawFileSystem) Lseek(cancel <-chan struct{}, in *fuse.LseekIn, out *fuse.LseekOut) fuse.Status {
+	ctx, s := rfs.createContext(cancel, &in.Caller)
+	if s != fuse.OK {
+		return s
+	}
 	rfs.nodeLock.RLock()
 	i := rfs.getLeafLocked(in.NodeId)
 	rfs.nodeLock.RUnlock()
@@ -705,9 +739,9 @@ func (rfs *simpleRawFileSystem) Lseek(cancel <-chan struct{}, in *fuse.LseekIn, 
 		panic("Requests for other seek modes should have been intercepted")
 	}
 
-	offset, s := i.VirtualSeek(in.Offset, regionType)
-	if s != virtual.StatusOK {
-		return toFUSEStatus(s)
+	offset, vs := i.VirtualSeek(ctx, in.Offset, regionType)
+	if vs != virtual.StatusOK {
+		return toFUSEStatus(vs)
 	}
 	if offset == nil {
 		return fuse.Status(syscall.ENXIO)
@@ -742,12 +776,16 @@ func (rfs *simpleRawFileSystem) Release(cancel <-chan struct{}, input *fuse.Rele
 }
 
 func (rfs *simpleRawFileSystem) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
+	ctx, s := rfs.createContext(cancel, &input.Caller)
+	if s != fuse.OK {
+		return 0, s
+	}
 	rfs.nodeLock.RLock()
 	i := rfs.getLeafLocked(input.NodeId)
 	rfs.nodeLock.RUnlock()
 
-	n, s := i.VirtualWrite(data, input.Offset)
-	return uint32(n), toFUSEStatus(s)
+	n, vs := i.VirtualWrite(ctx, data, input.Offset)
+	return uint32(n), toFUSEStatus(vs)
 }
 
 func (simpleRawFileSystem) CopyFileRange(cancel <-chan struct{}, input *fuse.CopyFileRangeIn) (uint32, fuse.Status) {
@@ -763,11 +801,15 @@ func (simpleRawFileSystem) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fu
 }
 
 func (rfs *simpleRawFileSystem) Fallocate(cancel <-chan struct{}, input *fuse.FallocateIn) fuse.Status {
+	ctx, s := rfs.createContext(cancel, &input.Caller)
+	if s != fuse.OK {
+		return s
+	}
 	rfs.nodeLock.RLock()
 	i := rfs.getLeafLocked(input.NodeId)
 	rfs.nodeLock.RUnlock()
 
-	return toFUSEStatus(i.VirtualAllocate(input.Offset, input.Length))
+	return toFUSEStatus(i.VirtualAllocate(ctx, input.Offset, input.Length))
 }
 
 func (rfs *simpleRawFileSystem) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {

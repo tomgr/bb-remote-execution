@@ -186,6 +186,8 @@ func toNTStatus(status virtual.Status) windows.NTStatus {
 		return windows.STATUS_UNEXPECTED_IO_ERROR
 	case virtual.StatusErrIsDir:
 		return windows.STATUS_FILE_IS_A_DIRECTORY
+	case virtual.StatusErrNameTooLong:
+		return windows.STATUS_NAME_TOO_LONG
 	case virtual.StatusErrNoEnt:
 		return windows.STATUS_OBJECT_NAME_NOT_FOUND
 	case virtual.StatusErrNotDir:
@@ -536,7 +538,7 @@ func (FileSystem) openOrCreateDir(ctx context.Context, parent virtual.Directory,
 	}
 
 	// Create new directory.
-	childDir, _, status := parent.VirtualMkdir(leafName, AttributesMaskForWinFSPAttr, attributes)
+	childDir, _, status := parent.VirtualMkdir(ctx, leafName, &virtual.Attributes{}, AttributesMaskForWinFSPAttr, attributes)
 	if status != virtual.StatusOK {
 		return virtual.DirectoryChild{}, toNTStatus(status)
 	}
@@ -834,7 +836,7 @@ func (fs *FileSystem) Overwrite(ref *ffi.FileSystemRef, handle uintptr, winfspAt
 }
 
 func (fs *FileSystem) Read(ref *ffi.FileSystemRef, handle uintptr, buffer []byte, offset uint64) (int, error) {
-	_, err := fs.createContext()
+	ctx, err := fs.createContext()
 	if err != nil {
 		return 0, err
 	}
@@ -843,7 +845,7 @@ func (fs *FileSystem) Read(ref *ffi.FileSystemRef, handle uintptr, buffer []byte
 	if err != nil {
 		return 0, err
 	}
-	read, eof, status := file.VirtualRead(buffer, offset)
+	read, eof, status := file.VirtualRead(ctx, buffer, offset)
 	if status != virtual.StatusOK {
 		return read, toNTStatus(status)
 	}
@@ -886,7 +888,7 @@ func (fs *FileSystem) Write(ref *ffi.FileSystemRef, handle uintptr, buf []byte, 
 		}
 	}
 
-	written, status := file.VirtualWrite(buf, offset)
+	written, status := file.VirtualWrite(ctx, buf, offset)
 	if status != virtual.StatusOK {
 		return written, toNTStatus(status)
 	}
@@ -1059,7 +1061,7 @@ func (fs *FileSystem) Cleanup(ref *ffi.FileSystemRef, handle uintptr, name strin
 		isDirectory := directory != nil
 		_, fileName, err := parsePath(name)
 		if err == nil && fileName != nil {
-			openNode.parent.VirtualRemove(*fileName, isDirectory, !isDirectory)
+			openNode.parent.VirtualRemove(ctx, *fileName, isDirectory, !isDirectory)
 		}
 	}
 }
@@ -1223,7 +1225,7 @@ func (fs *FileSystem) Rename(ref *ffi.FileSystemRef, handle uintptr, source, tar
 	}
 
 	// Perform the rename operation
-	if _, _, status := openNode.parent.VirtualRename(*sourceLeafName, targetParent, *targetLeafName); status != virtual.StatusOK {
+	if _, _, status := openNode.parent.VirtualRename(ctx, *sourceLeafName, targetParent, *targetLeafName); status != virtual.StatusOK {
 		return toNTStatus(status)
 	}
 	return nil
@@ -1449,7 +1451,7 @@ func (fs *FileSystem) SetReparsePoint(ref *ffi.FileSystemRef, handle uintptr, na
 		}
 		symbolicLinkBuffer := (*windowsext.SymbolicLinkReparseBuffer)(unsafe.Pointer(&reparseBuffer.DUMMYUNIONNAME))
 		targetPath := symbolicLinkBuffer.Path()
-		if _, s := node.parent.VirtualRemove(node.name, true, true); s != virtual.StatusOK {
+		if _, s := node.parent.VirtualRemove(ctx, node.name, true, true); s != virtual.StatusOK {
 			return toNTStatus(s)
 		}
 		var outAttributes virtual.Attributes

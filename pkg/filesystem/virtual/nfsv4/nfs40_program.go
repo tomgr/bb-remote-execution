@@ -16,7 +16,6 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/filesystem/path"
 	"github.com/buildbarn/bb-storage/pkg/random"
 	"github.com/buildbarn/go-xdr/pkg/protocols/nfsv4"
-	"github.com/buildbarn/go-xdr/pkg/protocols/rpcv2"
 	"github.com/buildbarn/go-xdr/pkg/runtime"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -74,6 +73,7 @@ type nfs40Program struct {
 	enforcedLeaseTime  time.Duration
 	announcedLeaseTime nfsv4.NfsLease4
 	pathFormat         path.Format
+	securityFlavors    []nfsv4.Secinfo4
 
 	lock                         sync.Mutex
 	now                          time.Time
@@ -99,6 +99,7 @@ func NewNFS40Program(
 	clock clock.Clock,
 	enforcedLeaseTime, announcedLeaseTime time.Duration,
 	pathFormat path.Format,
+	securityFlavors []nfsv4.Secinfo4,
 ) nfsv4.Nfs4Program {
 	nfs40ProgramPrometheusMetrics.Do(func() {
 		prometheus.MustRegister(nfs40ProgramOpenOwnersCreated)
@@ -122,6 +123,7 @@ func NewNFS40Program(
 		enforcedLeaseTime:  enforcedLeaseTime,
 		announcedLeaseTime: nfsv4.NfsLease4(announcedLeaseTime.Seconds()),
 		pathFormat:         pathFormat,
+		securityFlavors:    securityFlavors,
 
 		randomNumberGenerator:        randomNumberGenerator,
 		clientsByLongID:              map[string]*nfs40ClientState{},
@@ -313,13 +315,13 @@ func (p *nfs40Program) NfsV4Nfsproc4Compound(ctx context.Context, arguments *nfs
 			})
 			status = res.Status
 		case *nfsv4.NfsArgop4_OP_REMOVE:
-			res := state.opRemove(&op.Opremove)
+			res := state.opRemove(ctx, &op.Opremove)
 			resarray = append(resarray, &nfsv4.NfsResop4_OP_REMOVE{
 				Opremove: res,
 			})
 			status = res.GetStatus()
 		case *nfsv4.NfsArgop4_OP_RENAME:
-			res := state.opRename(&op.Oprename)
+			res := state.opRename(ctx, &op.Oprename)
 			resarray = append(resarray, &nfsv4.NfsResop4_OP_RENAME{
 				Oprename: res,
 			})
@@ -579,9 +581,12 @@ func (p *nfs40Program) writeAttributes(attributes *virtual.Attributes, attrReque
 					(1 << (nfsv4.FATTR4_NUMLINKS - 32)) |
 					(1 << (nfsv4.FATTR4_OWNER - 32)) |
 					(1 << (nfsv4.FATTR4_OWNER_GROUP - 32)) |
+					(1 << (nfsv4.FATTR4_RAWDEV - 32)) |
 					(1 << (nfsv4.FATTR4_TIME_ACCESS - 32)) |
+					(1 << (nfsv4.FATTR4_TIME_ACCESS_SET - 32)) |
 					(1 << (nfsv4.FATTR4_TIME_METADATA - 32)) |
-					(1 << (nfsv4.FATTR4_TIME_MODIFY - 32)),
+					(1 << (nfsv4.FATTR4_TIME_MODIFY - 32)) |
+					(1 << (nfsv4.FATTR4_TIME_MODIFY_SET - 32)),
 			})
 		}
 		if b := uint32(1 << nfsv4.FATTR4_TYPE); f&b != 0 {
@@ -684,13 +689,30 @@ func (p *nfs40Program) writeAttributes(attributes *virtual.Attributes, attrReque
 			}
 			nfsv4.WriteUtf8strMixed(w, v)
 		}
+		if b := uint32(1 << (nfsv4.FATTR4_RAWDEV - 32)); f&b != 0 {
+			s |= b
+			var sd nfsv4.Specdata4
+			if devNum, ok := attributes.GetDeviceNumber(); ok {
+				maj, min := devNum.ToMajorMinor()
+				sd = nfsv4.Specdata4{Specdata1: maj, Specdata2: min}
+			}
+			sd.WriteTo(w)
+		}
 		if b := uint32(1 << (nfsv4.FATTR4_TIME_ACCESS - 32)); f&b != 0 {
 			s |= b
-			deterministicNfstime4.WriteTo(w)
+			t := deterministicNfstime4
+			if lastAccessTime, ok := attributes.GetLastAccessTime(); ok {
+				t = timeToNfstime4(lastAccessTime)
+			}
+			t.WriteTo(w)
 		}
 		if b := uint32(1 << (nfsv4.FATTR4_TIME_METADATA - 32)); f&b != 0 {
 			s |= b
-			deterministicNfstime4.WriteTo(w)
+			t := deterministicNfstime4
+			if lastStatusChangeTime, ok := attributes.GetLastStatusChangeTime(); ok {
+				t = timeToNfstime4(lastStatusChangeTime)
+			}
+			t.WriteTo(w)
 		}
 		if b := uint32(1 << (nfsv4.FATTR4_TIME_MODIFY - 32)); f&b != 0 {
 			s |= b
@@ -1045,24 +1067,35 @@ func (s *compoundState) opCreate(ctx context.Context, args *nfsv4.Create4args) n
 		return &nfsv4.Create4res_default{Status: st}
 	}
 
-	var attributes virtual.Attributes
+	var createAttributes virtual.Attributes
+	if st := fattr4ToAttributes(&args.Createattrs, &createAttributes); st != nfsv4.NFS4_OK {
+		return &nfsv4.Create4res_default{Status: st}
+	}
+	var actualAttributes virtual.Attributes
 	var changeInfo virtual.ChangeInfo
 	var fileHandle nfs40FileHandle
 	var vs virtual.Status
 	switch objectType := args.Objtype.(type) {
-	case *nfsv4.Createtype4_NF4BLK, *nfsv4.Createtype4_NF4CHR:
-		// Character and block devices can only be provided as
-		// part of input roots, if workers are set up to provide
-		// them. They can't be created through the virtual file
-		// system.
-		return &nfsv4.Create4res_default{Status: nfsv4.NFS4ERR_PERM}
+	case *nfsv4.Createtype4_NF4BLK:
+		createAttributes.SetFileType(filesystem.FileTypeBlockDevice)
+		createAttributes.SetDeviceNumber(filesystem.NewDeviceNumberFromMajorMinor(objectType.Devdata.Specdata1, objectType.Devdata.Specdata2))
+		var leaf virtual.Leaf
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
+		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
+	case *nfsv4.Createtype4_NF4CHR:
+		createAttributes.SetFileType(filesystem.FileTypeCharacterDevice)
+		createAttributes.SetDeviceNumber(filesystem.NewDeviceNumberFromMajorMinor(objectType.Devdata.Specdata1, objectType.Devdata.Specdata2))
+		var leaf virtual.Leaf
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
+		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	case *nfsv4.Createtype4_NF4DIR:
 		var directory virtual.Directory
-		directory, changeInfo, vs = currentDirectory.VirtualMkdir(name, virtual.AttributesMaskFileHandle, &attributes)
+		directory, changeInfo, vs = currentDirectory.VirtualMkdir(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
 		fileHandle.node = virtual.DirectoryChild{}.FromDirectory(directory)
 	case *nfsv4.Createtype4_NF4FIFO:
+		createAttributes.SetFileType(filesystem.FileTypeFIFO)
 		var leaf virtual.Leaf
-		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, filesystem.FileTypeFIFO, virtual.AttributesMaskFileHandle, &attributes)
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
 		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	case *nfsv4.Createtype4_NF4LNK:
 		if !utf8.Valid(objectType.Linkdata) {
@@ -1074,12 +1107,13 @@ func (s *compoundState) opCreate(ctx context.Context, args *nfsv4.Create4args) n
 			path.UNIXFormat.NewParser(string(objectType.Linkdata)),
 			name,
 			virtual.AttributesMaskFileHandle,
-			&attributes,
+			&actualAttributes,
 		)
 		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	case *nfsv4.Createtype4_NF4SOCK:
+		createAttributes.SetFileType(filesystem.FileTypeSocket)
 		var leaf virtual.Leaf
-		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, filesystem.FileTypeSocket, virtual.AttributesMaskFileHandle, &attributes)
+		leaf, changeInfo, vs = currentDirectory.VirtualMknod(ctx, name, &createAttributes, virtual.AttributesMaskFileHandle, &actualAttributes)
 		fileHandle.node = virtual.DirectoryChild{}.FromLeaf(leaf)
 	default:
 		return &nfsv4.Create4res_default{Status: nfsv4.NFS4ERR_BADTYPE}
@@ -1087,7 +1121,7 @@ func (s *compoundState) opCreate(ctx context.Context, args *nfsv4.Create4args) n
 	if vs != virtual.StatusOK {
 		return &nfsv4.Create4res_default{Status: toNFSv4Status(vs)}
 	}
-	fileHandle.handle = attributes.GetFileHandle()
+	fileHandle.handle = actualAttributes.GetFileHandle()
 
 	s.currentFileHandle = fileHandle
 	return &nfsv4.Create4res_NFS4_OK{
@@ -1877,7 +1911,7 @@ func (s *compoundState) opRead(ctx context.Context, args *nfsv4.Read4args) nfsv4
 	defer cleanup()
 
 	buf := make([]byte, args.Count)
-	n, eof, vs := currentLeaf.VirtualRead(buf, args.Offset)
+	n, eof, vs := currentLeaf.VirtualRead(ctx, buf, args.Offset)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Read4res_default{Status: toNFSv4Status(vs)}
 	}
@@ -2011,7 +2045,7 @@ func (s *compoundState) opReleaseLockowner(args *nfsv4.ReleaseLockowner4args) nf
 	return nfsv4.ReleaseLockowner4res{Status: nfsv4.NFS4_OK}
 }
 
-func (s *compoundState) opRename(args *nfsv4.Rename4args) nfsv4.Rename4res {
+func (s *compoundState) opRename(ctx context.Context, args *nfsv4.Rename4args) nfsv4.Rename4res {
 	oldDirectory, st := s.savedFileHandle.getDirectory()
 	if st != nfsv4.NFS4_OK {
 		return &nfsv4.Rename4res_default{Status: st}
@@ -2029,7 +2063,7 @@ func (s *compoundState) opRename(args *nfsv4.Rename4args) nfsv4.Rename4res {
 		return &nfsv4.Rename4res_default{Status: nfsv4.NFS4ERR_BADNAME}
 	}
 
-	oldChangeInfo, newChangeInfo, vs := oldDirectory.VirtualRename(oldName, newDirectory, newName)
+	oldChangeInfo, newChangeInfo, vs := oldDirectory.VirtualRename(ctx, oldName, newDirectory, newName)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Rename4res_default{Status: toNFSv4Status(vs)}
 	}
@@ -2041,7 +2075,7 @@ func (s *compoundState) opRename(args *nfsv4.Rename4args) nfsv4.Rename4res {
 	}
 }
 
-func (s *compoundState) opRemove(args *nfsv4.Remove4args) nfsv4.Remove4res {
+func (s *compoundState) opRemove(ctx context.Context, args *nfsv4.Remove4args) nfsv4.Remove4res {
 	currentDirectory, st := s.currentFileHandle.getDirectory()
 	if st != nfsv4.NFS4_OK {
 		return &nfsv4.Remove4res_default{Status: st}
@@ -2051,7 +2085,7 @@ func (s *compoundState) opRemove(args *nfsv4.Remove4args) nfsv4.Remove4res {
 		return &nfsv4.Remove4res_default{Status: st}
 	}
 
-	changeInfo, vs := currentDirectory.VirtualRemove(name, true, true)
+	changeInfo, vs := currentDirectory.VirtualRemove(ctx, name, true, true)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Remove4res_default{Status: toNFSv4Status(vs)}
 	}
@@ -2102,9 +2136,6 @@ func (s *compoundState) opSecinfo(ctx context.Context, args *nfsv4.Secinfo4args)
 	// NFS4ERR_WRONGSEC is returned from another NFS operation. In
 	// practice, we even see it being called if no such error was
 	// returned.
-	//
-	// Because this NFS server is intended to be used for loopback
-	// purposes only, simply announce the use of AUTH_NONE.
 	currentDirectory, st := s.currentFileHandle.getDirectory()
 	if st != nfsv4.NFS4_OK {
 		return &nfsv4.Secinfo4res_default{Status: st}
@@ -2116,13 +2147,7 @@ func (s *compoundState) opSecinfo(ctx context.Context, args *nfsv4.Secinfo4args)
 	if _, vs := currentDirectory.VirtualLookup(ctx, name, 0, &virtual.Attributes{}); vs != virtual.StatusOK {
 		return &nfsv4.Secinfo4res_default{Status: toNFSv4Status(vs)}
 	}
-	return &nfsv4.Secinfo4res_NFS4_OK{
-		Resok4: []nfsv4.Secinfo4{
-			&nfsv4.Secinfo4_default{
-				Flavor: rpcv2.AUTH_NONE,
-			},
-		},
-	}
+	return &nfsv4.Secinfo4res_NFS4_OK{Resok4: s.program.securityFlavors}
 }
 
 func (s *compoundState) opSetattr(ctx context.Context, args *nfsv4.Setattr4args) nfsv4.Setattr4res {
@@ -2264,7 +2289,7 @@ func (s *compoundState) opWrite(ctx context.Context, args *nfsv4.Write4args) nfs
 	}
 	defer cleanup()
 
-	n, vs := currentLeaf.VirtualWrite(args.Data, args.Offset)
+	n, vs := currentLeaf.VirtualWrite(ctx, args.Data, args.Offset)
 	if vs != virtual.StatusOK {
 		return &nfsv4.Write4res_default{Status: toNFSv4Status(vs)}
 	}
@@ -2478,6 +2503,8 @@ func toNFSv4Status(s virtual.Status) nfsv4.Nfsstat4 {
 		return nfsv4.NFS4ERR_WRONG_TYPE
 	case virtual.StatusErrXDev:
 		return nfsv4.NFS4ERR_XDEV
+	case virtual.StatusErrNameTooLong:
+		return nfsv4.NFS4ERR_NAMETOOLONG
 	default:
 		panic("Unknown status")
 	}
@@ -3139,6 +3166,15 @@ func attrRequestToAttributesMask(attrRequest nfsv4.Bitmap4) virtual.AttributesMa
 		if f&uint32(1<<(nfsv4.FATTR4_OWNER_GROUP-32)) != 0 {
 			attributesMask |= virtual.AttributesMaskOwnerGroupID
 		}
+		if f&uint32(1<<(nfsv4.FATTR4_RAWDEV-32)) != 0 {
+			attributesMask |= virtual.AttributesMaskDeviceNumber
+		}
+		if f&uint32(1<<(nfsv4.FATTR4_TIME_ACCESS-32)) != 0 {
+			attributesMask |= virtual.AttributesMaskLastAccessTime
+		}
+		if f&uint32(1<<(nfsv4.FATTR4_TIME_METADATA-32)) != 0 {
+			attributesMask |= virtual.AttributesMaskLastStatusChangeTime
+		}
 		if f&uint32(1<<(nfsv4.FATTR4_TIME_MODIFY-32)) != 0 {
 			attributesMask |= virtual.AttributesMaskLastDataModificationTime
 		}
@@ -3272,6 +3308,15 @@ func (r *readdirReporter) ReportEntry(nextCookie uint64, name path.Component, ch
 // fattr4ToAttributes converts a client-provided NFSv4 fattr4 to a set
 // of virtual file system attributes. Only attributes that are both
 // writable and supported by this implementation are accepted.
+//
+// FATTR4_TIME_ACCESS_SET / FATTR4_TIME_MODIFY_SET requests that use
+// the SET_TO_SERVER_TIME4 arm are encoded by writing a zero
+// time.Time into the regular LastAccessTime / LastDataModificationTime
+// field; consumers detect this via time.IsZero() and substitute their
+// own current time (e.g., UTIME_NOW on utimensat). The sentinel
+// preserves the discriminant POSIX needs to apply utimensat
+// permission rules differently between explicit-time (owner only)
+// and UTIME_NOW (owner OR write permission).
 func fattr4ToAttributes(in *nfsv4.Fattr4, out *virtual.Attributes) nfsv4.Nfsstat4 {
 	r := bytes.NewBuffer(in.AttrVals)
 	if len(in.Attrmask) > 0 {
@@ -3293,7 +3338,9 @@ func fattr4ToAttributes(in *nfsv4.Fattr4, out *virtual.Attributes) nfsv4.Nfsstat
 		f := in.Attrmask[1]
 		if f&^((1<<(nfsv4.FATTR4_MODE-32))|
 			(1<<(nfsv4.FATTR4_OWNER-32))|
-			(1<<(nfsv4.FATTR4_OWNER_GROUP-32))) != 0 {
+			(1<<(nfsv4.FATTR4_OWNER_GROUP-32))|
+			(1<<(nfsv4.FATTR4_TIME_ACCESS_SET-32))|
+			(1<<(nfsv4.FATTR4_TIME_MODIFY_SET-32))) != 0 {
 			return nfsv4.NFS4ERR_ATTRNOTSUPP
 		}
 		if f&(1<<(nfsv4.FATTR4_MODE-32)) != 0 {
@@ -3303,8 +3350,63 @@ func fattr4ToAttributes(in *nfsv4.Fattr4, out *virtual.Attributes) nfsv4.Nfsstat
 			}
 			out.SetPermissions(virtual.NewPermissionsFromMode(mode))
 		}
-		if f&((1<<(nfsv4.FATTR4_OWNER-32))|(1<<(nfsv4.FATTR4_OWNER_GROUP-32))) != 0 {
-			return nfsv4.NFS4ERR_PERM
+		if f&(1<<(nfsv4.FATTR4_OWNER-32)) != 0 {
+			// RFC 7530 §5.8.2.21 / RFC 8881 §5.9: FATTR4_OWNER is
+			// "user@domain" form. The corresponding emission code
+			// in writeAttributes already only writes numeric uid as
+			// a decimal string, so we accept the same form on parse
+			// for round-trip symmetry. Textual name@domain
+			// resolution would require an injectable resolver and
+			// is not currently supported.
+			owner, _, err := nfsv4.ReadUtf8strMixed(r)
+			if err != nil {
+				return nfsv4.NFS4ERR_BADXDR
+			}
+			uid, err := strconv.ParseUint(string(owner), 10, 32)
+			if err != nil {
+				return nfsv4.NFS4ERR_BADOWNER
+			}
+			out.SetOwnerUserID(uint32(uid))
+		}
+		if f&(1<<(nfsv4.FATTR4_OWNER_GROUP-32)) != 0 {
+			// See FATTR4_OWNER above for the numeric-only rationale.
+			group, _, err := nfsv4.ReadUtf8strMixed(r)
+			if err != nil {
+				return nfsv4.NFS4ERR_BADXDR
+			}
+			gid, err := strconv.ParseUint(string(group), 10, 32)
+			if err != nil {
+				return nfsv4.NFS4ERR_BADOWNER
+			}
+			out.SetOwnerGroupID(uint32(gid))
+		}
+		if f&(1<<(nfsv4.FATTR4_TIME_ACCESS_SET-32)) != 0 {
+			st, _, err := nfsv4.ReadFattr4TimeAccessSet(r)
+			if err != nil {
+				return nfsv4.NFS4ERR_BADXDR
+			}
+			switch v := st.(type) {
+			case *nfsv4.Settime4_SET_TO_CLIENT_TIME4:
+				out.SetLastAccessTime(time.Unix(v.Time.Seconds, int64(v.Time.Nseconds)))
+			default:
+				// SET_TO_SERVER_TIME4: write a zero time.Time as
+				// the "use server time" sentinel; consumers
+				// detect via IsZero() and substitute their own
+				// current time (e.g., UTIME_NOW).
+				out.SetLastAccessTime(time.Time{})
+			}
+		}
+		if f&(1<<(nfsv4.FATTR4_TIME_MODIFY_SET-32)) != 0 {
+			st, _, err := nfsv4.ReadFattr4TimeModifySet(r)
+			if err != nil {
+				return nfsv4.NFS4ERR_BADXDR
+			}
+			switch v := st.(type) {
+			case *nfsv4.Settime4_SET_TO_CLIENT_TIME4:
+				out.SetLastDataModificationTime(time.Unix(v.Time.Seconds, int64(v.Time.Nseconds)))
+			default:
+				out.SetLastDataModificationTime(time.Time{})
+			}
 		}
 	}
 	for i := 2; i < len(in.Attrmask); i++ {
@@ -3367,6 +3469,9 @@ func nfsv4NewComponent(name string) (path.Component, nfsv4.Nfsstat4) {
 		// Name that is invalid for this implementation.
 		return path.Component{}, nfsv4.NFS4ERR_BADNAME
 	}
+	// NAME_MAX (and other implementation-specific length bounds) is
+	// enforced by the Directory implementation; it surfaces back as
+	// StatusErrNameTooLong → NFS4ERR_NAMETOOLONG via toNFSv4Status.
 	return component, nfsv4.NFS4_OK
 }
 
